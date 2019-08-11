@@ -1,0 +1,704 @@
+4.spark-submit(standalone client模式)-启动executor
+
+在不同的部署环境下提交任务的流程也不同。讨论standalone client模式启动executor代码分析。
+4.1.使用spark-submit提交任务（远程调试）
+spark-submit --class com.kyrie.first.FirstRemote \
+--master spark://192.168.1.62:7077 \
+--driver-java-options "-Xdebug -Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=10000" \
+--conf spark.executor.extraJavaOptions="-Xdebug -Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=10002" \
+/home/hadoop/changyue/spark-source-2.4-1.0-SNAPSHOT.jar
+
+driver-java-options 用于调试driver
+spark.executor.extraJavaOptions用于调试executor。
+所以idea中要配置两个远程调试，分配监控10000，10002.
+
+
+4.2.在spark-submit脚本中调用spark-class 把所有参数传过去。
+
+
+exec "${SPARK_HOME}"/bin/spark-class org.apache.spark.deploy.SparkSubmit "$@"
+
+4.3.在spark-class脚本中启动Main类
+
+build_command() {
+  "$RUNNER" -Xmx128m -cp "$LAUNCH_CLASSPATH" org.apache.spark.launcher.Main "$@"
+  printf "%d\0" $?
+}
+CMD=()
+while IFS= read -d '' -r ARG; do
+  CMD+=("$ARG")
+done < <(build_command "$@")
+
+4.4.执行launcher.Main类的main函数
+作用：解析上面的shell传递过来的参数，启动SparkSubmit类调用main函数
+
+
+public static void main(String[] argsArray) throws Exception {
+
+    checkArgument(argsArray.length > 0, "Not enough arguments: missing class name.");
+
+
+    List<String> args = new ArrayList<>(Arrays.asList(argsArray));
+
+    String className = args.remove(0);
+
+
+    boolean printLaunchCommand = !isEmpty(System.getenv("SPARK_PRINT_LAUNCH_COMMAND"));
+
+    AbstractCommandBuilder builder;
+
+    if (className.equals("org.apache.spark.deploy.SparkSubmit")) {
+
+      try {
+
+          //解析shell传过来的参数，mainClass就是我们程序的主函数：com.kyrie.first.FirstRemote
+
+        builder = new SparkSubmitCommandBuilder(args);
+
+      } catch (IllegalArgumentException e) {
+
+        printLaunchCommand = false;
+
+        System.err.println("Error: " + e.getMessage());
+
+        System.err.println();
+        MainClassOptionParser parser = new MainClassOptionParser();
+        try {
+          parser.parse(args);
+        } catch (Exception ignored) {
+          // Ignore parsing exceptions.
+        }
+        List<String> help = new ArrayList<>();
+        if (parser.className != null) {
+          help.add(parser.CLASS);
+          help.add(parser.className);
+        }
+        help.add(parser.USAGE_ERROR);
+        builder = new SparkSubmitCommandBuilder(help);
+      }
+    } else {
+      builder = new SparkClassCommandBuilder(className, args);
+    }
+    Map<String, String> env = new HashMap<>();
+    List<String> cmd = builder.buildCommand(env);
+    if (printLaunchCommand) {
+      System.err.println("Spark Command: " + join(" ", cmd));
+      System.err.println("========================================");
+    }
+    if (isWindows()) {
+      System.out.println(prepareWindowsCommand(cmd, env));
+    } else {
+      // In bash, use NULL as the arg separator since it cannot be used in an argument.
+        //构建启动SparkSubmit类的参数
+      List<String> bashCmd = prepareBashCommand(cmd, env);
+      for (String c : bashCmd) {
+        System.out.print(c); //启动spark-submit类的main函数
+        System.out.print('\0');
+      }
+    }
+  }
+
+4.5.执行SparkSubmit 的main方法
+作用:调用SparkSubmit.submit函数
+
+
+def main(args: Array[String]): Unit = {
+    //解析参数
+    val appArgs = new SparkSubmitArguments(args)
+    if (appArgs.verbose) {
+      // scalastyle:off println
+      printStream.println(appArgs)
+      // scalastyle:on println
+    }
+    appArgs.action match {
+      case SparkSubmitAction.SUBMIT => submit(appArgs)
+      case SparkSubmitAction.KILL => kill(appArgs)
+      case SparkSubmitAction.REQUEST_STATUS => requestStatus(appArgs)
+    }
+  }
+
+4.6.SparkSubmit.submit函数
+作用：1.设置启动环境,根据运行环境返回不同的执行类,standalone clien模式返回childMainClass是com.kyrie.first.FirstRemote。
+       2.调用runMain
+
+private def submit(args: SparkSubmitArguments): Unit = {
+    //返回环境配置
+    val (childArgs, childClasspath, sysProps, childMainClass) = prepareSubmitEnvironment(args)
+    def doRunMain(): Unit = {
+      if (args.proxyUser != null) {
+        val proxyUser = UserGroupInformation.createProxyUser(args.proxyUser,
+          UserGroupInformation.getCurrentUser())
+        try {
+          proxyUser.doAs(new PrivilegedExceptionAction[Unit]() {
+            override def run(): Unit = {
+              runMain(childArgs, childClasspath, sysProps, childMainClass, args.verbose)
+            }
+          })
+        } catch {
+          case e: Exception =>
+            // Hadoop's AuthorizationException suppresses the exception's stack trace, which
+            // makes the message printed to the output by the JVM not very helpful. Instead,
+            // detect exceptions with empty stack traces here, and treat them differently.
+            if (e.getStackTrace().length == 0) {
+              // scalastyle:off println
+              printStream.println(s"ERROR: ${e.getClass().getName()}: ${e.getMessage()}")
+              // scalastyle:on println
+              exitFn(1)
+            } else {
+              throw e
+            }
+        }
+      } else {
+        runMain(childArgs, childClasspath, sysProps, childMainClass, args.verbose)
+      }
+    }
+
+
+4.7.执行Sparksubimt.runMain
+创建JavaMainApplication()对象并调用其start方法，start方法调用com.kyrie.first.FirstRemote的main方法。
+  private def runMain(
+      childArgs: Seq[String],
+      childClasspath: Seq[String],
+      sparkConf: SparkConf,
+      childMainClass: String,
+      verbose: Boolean): Unit = {
+    if (verbose) {
+      logInfo(s"Main class:\n$childMainClass")
+      logInfo(s"Arguments:\n${childArgs.mkString("\n")}")
+      // sysProps may contain sensitive information, so redact before printing
+      logInfo(s"Spark config:\n${Utils.redact(sparkConf.getAll.toMap).mkString("\n")}")
+      logInfo(s"Classpath elements:\n${childClasspath.mkString("\n")}")
+      logInfo("\n")
+    }
+    val loader =
+      if (sparkConf.get(DRIVER_USER_CLASS_PATH_FIRST)) {
+        new ChildFirstURLClassLoader(new Array[URL](0),
+          Thread.currentThread.getContextClassLoader)
+      } else {
+        new MutableURLClassLoader(new Array[URL](0),
+          Thread.currentThread.getContextClassLoader)
+      }
+    Thread.currentThread.setContextClassLoader(loader)
+    for (jar <- childClasspath) {
+      addJarToClasspath(jar, loader)
+    }
+    var mainClass: Class[_] = null
+    try {
+      mainClass = Utils.classForName(childMainClass)
+    } catch {
+      case e: ClassNotFoundException =>
+        logWarning(s"Failed to load $childMainClass.", e)
+        if (childMainClass.contains("thriftserver")) {
+          logInfo(s"Failed to load main class $childMainClass.")
+          logInfo("You need to build Spark with -Phive and -Phive-thriftserver.")
+        }
+        throw new SparkUserAppException(CLASS_NOT_FOUND_EXIT_STATUS)
+      case e: NoClassDefFoundError =>
+        logWarning(s"Failed to load $childMainClass: ${e.getMessage()}")
+        if (e.getMessage.contains("org/apache/hadoop/hive")) {
+          logInfo(s"Failed to load hive class.")
+          logInfo("You need to build Spark with -Phive and -Phive-thriftserver.")
+        }
+        throw new SparkUserAppException(CLASS_NOT_FOUND_EXIT_STATUS)
+    }
+    val app: SparkApplication = if (classOf[SparkApplication].isAssignableFrom(mainClass)) {
+      mainClass.newInstance().asInstanceOf[SparkApplication]
+    } else {
+      // SPARK-4170
+      if (classOf[scala.App].isAssignableFrom(mainClass)) {
+        logWarning("Subclasses of scala.App may not work correctly. Use a main() method instead.")
+      }
+      new JavaMainApplication(mainClass)
+    }
+    //删除无用代码
+    ....
+    try {
+      app.start(childArgs.toArray, sparkConf)
+    } catch {
+       case t: Throwable =>
+        throw findCause(t)
+   }
+}
+
+4.8. JavaMainApplication的start方法
+
+start方法调用com.kyrie.first.FirstRemote的main方法。
+private[deploy] class JavaMainApplication(klass: Class[_]) extends SparkApplication {
+  override def start(args: Array[String], conf: SparkConf): Unit = {
+    val mainMethod = klass.getMethod("main", new Array[String](0).getClass)
+    if (!Modifier.isStatic(mainMethod.getModifiers)) {
+      throw new IllegalStateException("The main method in the given main class must be static")
+    }
+    val sysProps = conf.getAll.toMap
+    sysProps.foreach { case (k, v) =>
+      sys.props(k) = v
+    }
+    mainMethod.invoke(null, args)
+  }
+
+4.9.执行用户自定义类的main方法。
+创建SparkContext对象。
+var appName = "FirstRemote"
+  def main(args: Array[String]) {
+    System.setProperty("HADOOP_USER_NAME","hadoop")
+    val sc = sparkContext()
+    val rdd = sc.textFile("hdfs://192.168.1.61:9000/a.txt")
+    println(rdd.collect().mkString(","))
+  }
+  def sparkContext(): SparkContext = {
+    val conf = new SparkConf().setAppName(appName).setMaster("spark://192.168.1.61:7077")
+    conf.set("spark.driver.memory","400m")
+    conf.set("spark.executor.memory","500m")
+    conf.set("","")
+    conf.set("spark.executor.cores","1")
+    val sc = new SparkContext(conf)
+    sc
+  }
+
+4.10.执行SparkContext构造函数
+创建一堆对象，这里只讨论
+_schedulerBackend=StandaloneSchedulerBackend
+_taskScheduler=TaskSchedulerImpl
+这两对象。
+createTaskScheduler根据不同的部署模式创建上面两个对象。
+调用_taskScheduler.start()方法
+    val (sched, ts) = SparkContext.createTaskScheduler(this, master, deployMode)
+    _schedulerBackend = sched
+    _taskScheduler = ts
+    _dagScheduler = new DAGScheduler(this)
+    _heartbeatReceiver.ask[Boolean](TaskSchedulerIsSet)
+    // start TaskScheduler after taskScheduler sets DAGScheduler reference in DAGScheduler's
+    // constructor
+    _taskScheduler.start()
+
+4.11.执行TaskSchedulerImpl的start方法
+调用StandaloneSchedulerBackend方法；
+检测是否开启spark.speculation.
+override def start() {
+    backend.start()
+    if (!isLocal && conf.getBoolean("spark.speculation", false)) {
+      logInfo("Starting speculative execution thread")
+      speculationScheduler.scheduleWithFixedDelay(new Runnable {
+        override def run(): Unit = Utils.tryOrStopSparkContext(sc) {
+          checkSpeculatableTasks()
+        }
+      }, SPECULATION_INTERVAL_MS, SPECULATION_INTERVAL_MS, TimeUnit.MILLISECONDS)
+    }
+  }
+
+4.12.执行StandaloneSchedulerBackend的start方法
+封装driver的信息
+设置启动executor的启动类（CoarseGrainedExecutorBackend）和启动环境
+创建StandaloneAppClient 对象，并调用其start方法
+等待application注册完成。
+  override def start() {
+    super.start()
+    // SPARK-21159. The scheduler backend should only try to connect to the launcher when in client
+    // mode. In cluster mode, the code that submits the application to the Master needs to connect
+    // to the launcher instead.
+    if (sc.deployMode == "client") {
+      launcherBackend.connect()
+    }
+//封装driver信息
+val driverUrl = RpcEndpointAddress(
+  sc.conf.get("spark.driver.host"),
+  sc.conf.get("spark.driver.port").toInt,
+  CoarseGrainedSchedulerBackend.ENDPOINT_NAME).toString
+val args = Seq(
+  "--driver-url", driverUrl,
+  "--executor-id", "{{EXECUTOR_ID}}",
+  "--hostname", "{{HOSTNAME}}",
+  "--cores", "{{CORES}}",
+  "--app-id", "{{APP_ID}}",
+  "--worker-url", "{{WORKER_URL}}")
+......
+.....
+    // Start executors with a few necessary configs for registering with the scheduler
+    val sparkJavaOpts = Utils.sparkJavaOpts(conf, SparkConf.isExecutorStartupConf)
+    val javaOpts = sparkJavaOpts ++ extraJavaOpts
+    val command = Command("org.apache.spark.executor.CoarseGrainedExecutorBackend",
+      args, sc.executorEnvs, classPathEntries ++ testingClassPath, libraryPathEntries, javaOpts)
+    val webUrl = sc.ui.map(_.webUrl).getOrElse("")
+    val coresPerExecutor = conf.getOption("spark.executor.cores").map(_.toInt)
+    // If we're using dynamic allocation, set our initial executor limit to 0 for now.
+    // ExecutorAllocationManager will send the real initial limit to the Master later.
+    val initialExecutorLimit =
+      if (Utils.isDynamicAllocationEnabled(conf)) {
+        Some(0)
+      } else {
+        None
+      }
+    val appDesc = ApplicationDescription(sc.appName, maxCores, sc.executorMemory, command,
+      webUrl, sc.eventLogDir, sc.eventLogCodec, coresPerExecutor, initialExecutorLimit)
+    client = new StandaloneAppClient(sc.env.rpcEnv, masters, appDesc, this, conf)
+    client.start()
+    launcherBackend.setState(SparkAppHandle.State.SUBMITTED)
+    waitForRegistration()
+    launcherBackend.setState(SparkAppHandle.State.RUNNING)
+  }
+
+4.13.执行StandaloneAppClient的start方法
+创建ClientEndpoint对象，添加到rpcEnv上。此时默认会执行ClientEndpoint的onStart方法。此对象driver对象。
+def start() {
+    // Just launch an rpcEndpoint; it will call back into the listener.
+    endpoint.set(rpcEnv.setupEndpoint("AppClient", new ClientEndpoint(rpcEnv)))
+  }
+
+4.14.执行ClientEndpoint的onStart方法
+调用ClientEndpoint. registerWithMaster()方法
+override def onStart(): Unit = {
+      try {
+        registerWithMaster(1)
+      } catch {
+        case e: Exception =>
+          logWarning("Failed to connect to master", e)
+          markDisconnected()
+          stop()
+      }
+    }
+
+4.15.执行registerWithMaster方法
+
+调用tryRegisterAllMasters方法
+
+private def registerWithMaster(nthRetry: Int) {
+      registerMasterFutures.set(tryRegisterAllMasters())
+      registrationRetryTimer.set(registrationRetryThread.schedule(new Runnable {
+        override def run(): Unit = {
+          if (registered.get) {
+            registerMasterFutures.get.foreach(_.cancel(true))
+            registerMasterThreadPool.shutdownNow()
+          } else if (nthRetry >= REGISTRATION_RETRIES) {
+            markDead("All masters are unresponsive! Giving up.")
+          } else {
+            registerMasterFutures.get.foreach(_.cancel(true))
+            registerWithMaster(nthRetry + 1)
+          }
+        }
+      }, REGISTRATION_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+    }
+
+4.16.执行tryRegisterAllMaster方法
+向master发送RegisterApplication消息
+
+private def tryRegisterAllMasters(): Array[JFuture[_]] = {
+      for (masterAddress <- masterRpcAddresses) yield {
+        registerMasterThreadPool.submit(new Runnable {
+          override def run(): Unit = try {
+            if (registered.get) {
+              return
+            }
+            logInfo("Connecting to master " + masterAddress.toSparkURL + "...")
+            val masterRef = rpcEnv.setupEndpointRef(masterAddress, Master.ENDPOINT_NAME)
+            masterRef.send(RegisterApplication(appDescription, self))
+          } catch {
+            case ie: InterruptedException => // Cancelled
+            case NonFatal(e) => logWarning(s"Failed to connect to master $masterAddress", e)
+          }
+        })
+      }
+    }
+
+
+4.17.master接收到RegisterApplication消息执行响应逻辑
+注册application到master
+发送RegisteredApplication消息给driver
+调用schedule函数
+
+//Master类recevice方法中代码
+case RegisterApplication(description, driver) =>
+      // TODO Prevent repeated registrations from some driver
+      if (state == RecoveryState.STANDBY) {
+        // ignore, don't send response
+      } else {
+        logInfo("Registering app " + description.name)
+        val app = createApplication(description, driver)
+        registerApplication(app)
+        logInfo("Registered app " + description.name + " with ID " + app.id)
+        persistenceEngine.addApplication(app)
+        driver.send(RegisteredApplication(app.id, self))
+        schedule()
+      }
+
+执行registerApplication方法：
+添加app信息到master的各个几何中，
+private def registerApplication(app: ApplicationInfo): Unit = {
+    val appAddress = app.driver.address
+    if (addressToApp.contains(appAddress)) {
+      logInfo("Attempted to re-register application at same address: " + appAddress)
+      return
+    }
+    applicationMetricsSystem.registerSource(app.appSource)
+    apps += app
+    idToApp(app.id) = app
+    endpointToApp(app.driver) = app
+    addressToApp(appAddress) = app
+    waitingApps += app
+  }
+
+4.18.执行schedule方法
+判断worker是否有足够资源。
+调用startExecutorsOnWorkers方法
+
+private def schedule(): Unit = {
+    if (state != RecoveryState.ALIVE) {
+      return
+    }
+    // Drivers take strict precedence over executors
+    val shuffledAliveWorkers = Random.shuffle(workers.toSeq.filter(_.state == WorkerState.ALIVE))
+    val numWorkersAlive = shuffledAliveWorkers.size
+    var curPos = 0
+    for (driver <- waitingDrivers.toList) { // iterate over a copy of waitingDrivers
+      // We assign workers to each waiting driver in a round-robin fashion. For each driver, we
+      // start from the last worker that was assigned a driver, and continue onwards until we have
+      // explored all alive workers.
+      var launched = false
+      var numWorkersVisited = 0
+      while (numWorkersVisited < numWorkersAlive && !launched) {
+        val worker = shuffledAliveWorkers(curPos)
+        numWorkersVisited += 1
+        if (worker.memoryFree >= driver.desc.mem && worker.coresFree >= driver.desc.cores) {
+          launchDriver(worker, driver)
+          waitingDrivers -= driver
+          launched = true
+        }
+        curPos = (curPos + 1) % numWorkersAlive
+      }
+    }
+    startExecutorsOnWorkers()
+  }
+
+4.19.执行startExecutorsOnWorkers方法
+分配多少core给executor
+调用allocateWorkerResourceToExecutors函数，发送消息给worker启动executor
+private def startExecutorsOnWorkers(): Unit = {
+    // Right now this is a very simple FIFO scheduler. We keep trying to fit in the first app
+    // in the queue, then the second app, etc.
+    for (app <- waitingApps) {
+      val coresPerExecutor = app.desc.coresPerExecutor.getOrElse(1)
+      // If the cores left is less than the coresPerExecutor,the cores left will not be allocated
+      if (app.coresLeft >= coresPerExecutor) {
+        // Filter out workers that don't have enough resources to launch an executor
+        val usableWorkers = workers.toArray.filter(_.state == WorkerState.ALIVE)
+          .filter(worker => worker.memoryFree >= app.desc.memoryPerExecutorMB &&
+            worker.coresFree >= coresPerExecutor)
+          .sortBy(_.coresFree).reverse
+        val assignedCores = scheduleExecutorsOnWorkers(app, usableWorkers, spreadOutApps)
+        // Now that we've decided how many cores to allocate on each worker, let's allocate them
+        for (pos <- 0 until usableWorkers.length if assignedCores(pos) > 0) {
+          allocateWorkerResourceToExecutors(
+            app, assignedCores(pos), app.desc.coresPerExecutor, usableWorkers(pos))
+        }
+      }
+    }
+  }
+
+4.20.执行allocateWorkerResourceToExecutors方法
+调用launchExecutor方法。
+private def allocateWorkerResourceToExecutors(
+      app: ApplicationInfo,
+      assignedCores: Int,
+      coresPerExecutor: Option[Int],
+      worker: WorkerInfo): Unit = {
+    // If the number of cores per executor is specified, we divide the cores assigned
+    // to this worker evenly among the executors with no remainder.
+    // Otherwise, we launch a single executor that grabs all the assignedCores on this worker.
+    val numExecutors = coresPerExecutor.map { assignedCores / _ }.getOrElse(1)
+    val coresToAssign = coresPerExecutor.getOrElse(assignedCores)
+    for (i <- 1 to numExecutors) {
+      val exec = app.addExecutor(worker, coresToAssign)
+      launchExecutor(worker, exec)
+      app.state = ApplicationState.RUNNING
+    }
+  }
+
+4.21.执行launchExecutor
+向worker发送LaunchExecutor消息
+向driver发送ExecutorAdded消息。
+private def launchExecutor(worker: WorkerInfo, exec: ExecutorDesc): Unit = {
+    logInfo("Launching executor " + exec.fullId + " on worker " + worker.id)
+    worker.addExecutor(exec)
+    worker.endpoint.send(LaunchExecutor(masterUrl,
+      exec.application.id, exec.id, exec.application.desc, exec.cores, exec.memory))
+    exec.application.driver.send(
+      ExecutorAdded(exec.id, worker.id, worker.hostPort, exec.cores, exec.memory))
+  }
+
+4.22.Worker接收到LaunchExecutor消息执行相应的操作
+创建ExecutorRunner对象，执行其start方法
+
+case LaunchExecutor(masterUrl, appId, execId, appDesc, cores_, memory_) =>
+      if (masterUrl != activeMasterUrl) {
+        logWarning("Invalid Master (" + masterUrl + ") attempted to launch executor.")
+      } else {
+        try {
+          logInfo("Asked to launch executor %s/%d for %s".format(appId, execId, appDesc.name))
+          // Create the executor's working directory
+          val executorDir = new File(workDir, appId + "/" + execId)
+          if (!executorDir.mkdirs()) {
+            throw new IOException("Failed to create directory " + executorDir)
+          }
+          // Create local dirs for the executor. These are passed to the executor via the
+          // SPARK_EXECUTOR_DIRS environment variable, and deleted by the Worker when the
+          // application finishes.
+          val appLocalDirs = appDirectories.getOrElse(appId, {
+            val localRootDirs = Utils.getOrCreateLocalRootDirs(conf)
+            val dirs = localRootDirs.flatMap { dir =>
+              try {
+                val appDir = Utils.createDirectory(dir, namePrefix = "executor")
+                Utils.chmod700(appDir)
+                Some(appDir.getAbsolutePath())
+              } catch {
+                case e: IOException =>
+                  logWarning(s"${e.getMessage}. Ignoring this directory.")
+                  None
+              }
+            }.toSeq
+            if (dirs.isEmpty) {
+              throw new IOException("No subfolder can be created in " +
+                s"${localRootDirs.mkString(",")}.")
+            }
+            dirs
+          })
+          appDirectories(appId) = appLocalDirs
+          val manager = new ExecutorRunner(
+            appId,
+            execId,
+            appDesc.copy(command = Worker.maybeUpdateSSLSettings(appDesc.command, conf)),
+            cores_,
+            memory_,
+            self,
+            workerId,
+            host,
+            webUi.boundPort,
+            publicAddress,
+            sparkHome,
+            executorDir,
+            workerUri,
+            conf,
+            appLocalDirs, ExecutorState.RUNNING)
+          executors(appId + "/" + execId) = manager
+          manager.start()
+          coresUsed += cores_
+          memoryUsed += memory_
+          sendToMaster(ExecutorStateChanged(appId, execId, manager.state, None, None))
+        } catch {
+          case e: Exception =>
+            logError(s"Failed to launch executor $appId/$execId for ${appDesc.name}.", e)
+            if (executors.contains(appId + "/" + execId)) {
+              executors(appId + "/" + execId).kill()
+              executors -= appId + "/" + execId
+            }
+            sendToMaster(ExecutorStateChanged(appId, execId, ExecutorState.FAILED,
+              Some(e.toString), None))
+        }
+      }
+
+4.23.执行ExecutorRunner.start方法
+调用fetchAndRunExecutor方法
+private[worker] def start() {
+    workerThread = new Thread("ExecutorRunner for " + fullId) {
+      override def run() { fetchAndRunExecutor() }
+    }
+    workerThread.start()
+    // Shutdown hook that kills actors on shutdown.
+    shutdownHook = ShutdownHookManager.addShutdownHook { () =>
+      // It's possible that we arrive here before calling `fetchAndRunExecutor`, then `state` will
+      // be `ExecutorState.RUNNING`. In this case, we should set `state` to `FAILED`.
+      if (state == ExecutorState.RUNNING) {
+        state = ExecutorState.FAILED
+      }
+      killProcess(Some("Worker shutting down")) }
+  }
+
+4.24.执行fetchAndRunExecutor方法
+调用启动CoarseGrainedExecutorBackend类命令。
+
+private def fetchAndRunExecutor() {
+    try {
+      // Launch the process
+      val subsOpts = appDesc.command.javaOpts.map {
+        Utils.substituteAppNExecIds(_, appId, execId.toString)
+      }
+      val subsCommand = appDesc.command.copy(javaOpts = subsOpts)
+      val builder = CommandUtils.buildProcessBuilder(subsCommand, new SecurityManager(conf),
+        memory, sparkHome.getAbsolutePath, substituteVariables)
+      val command = builder.command()
+      val formattedCommand = command.asScala.mkString("\"", "\" \"", "\"")
+      logInfo(s"Launch command: $formattedCommand")
+      builder.directory(executorDir)
+      builder.environment.put("SPARK_EXECUTOR_DIRS", appLocalDirs.mkString(File.pathSeparator))
+      // In case we are running this from within the Spark Shell, avoid creating a "scala"
+      // parent process for the executor command
+      builder.environment.put("SPARK_LAUNCH_WITH_SCALA", "0")
+      // Add webUI log urls
+      val baseUrl =
+        if (conf.getBoolean("spark.ui.reverseProxy", false)) {
+          s"/proxy/$workerId/logPage/?appId=$appId&executorId=$execId&logType="
+        } else {
+          s"http://$publicAddress:$webUiPort/logPage/?appId=$appId&executorId=$execId&logType="
+        }
+      builder.environment.put("SPARK_LOG_URL_STDERR", s"${baseUrl}stderr")
+      builder.environment.put("SPARK_LOG_URL_STDOUT", s"${baseUrl}stdout")
+      process = builder.start()
+      val header = "Spark Executor Command: %s\n%s\n\n".format(
+        formattedCommand, "=" * 40)
+      // Redirect its stdout and stderr to files
+      val stdout = new File(executorDir, "stdout")
+      stdoutAppender = FileAppender(process.getInputStream, stdout, conf)
+      val stderr = new File(executorDir, "stderr")
+      Files.write(header, stderr, StandardCharsets.UTF_8)
+      stderrAppender = FileAppender(process.getErrorStream, stderr, conf)
+      // Wait for it to exit; executor may exit with code 0 (when driver instructs it to shutdown)
+      // or with nonzero exit code
+      val exitCode = process.waitFor()
+      state = ExecutorState.EXITED
+      val message = "Command exited with code " + exitCode
+      worker.send(ExecutorStateChanged(appId, execId, state, Some(message), Some(exitCode)))
+    } catch {
+      case interrupted: InterruptedException =>
+        logInfo("Runner thread for executor " + fullId + " interrupted")
+        state = ExecutorState.KILLED
+        killProcess(None)
+      case e: Exception =>
+        logError("Error running executor", e)
+        state = ExecutorState.FAILED
+        killProcess(Some(e.toString))
+    }
+  }
+
+
+配置 --conf spark.executor.extraJavaOptions=-Xdebug -Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=10002 可调试CoarseGrainedExecutorBackend的启动过程。
+4.25.CoarseGrainedExecutorBackend的main函数
+
+创建sparkEnv
+创建CoarseGrainedExecutorBackend对象
+创建WorkerWatcher对象。
+
+val env = SparkEnv.createExecutorEnv(
+        driverConf, executorId, hostname, cores, cfg.ioEncryptionKey, isLocal = false)
+      env.rpcEnv.setupEndpoint("Executor", new CoarseGrainedExecutorBackend(
+        env.rpcEnv, driverUrl, executorId, hostname, cores, userClassPath, env))
+      workerUrl.foreach { url =>
+        env.rpcEnv.setupEndpoint("WorkerWatcher", new WorkerWatcher(env.rpcEnv, url))
+      }
+      env.rpcEnv.awaitTermination()
+
+#执行CoarseGrainedExecutorBackend对象onStart方法
+向driver发送RegisterExecutor消息。
+override def onStart() {
+    logInfo("Connecting to driver: " + driverUrl)
+    rpcEnv.asyncSetupEndpointRefByURI(driverUrl).flatMap { ref =>
+      // This is a very fast action so we can use "ThreadUtils.sameThread"
+      driver = Some(ref)
+      ref.ask[Boolean](RegisterExecutor(executorId, self, hostname, cores, extractLogUrls))
+    }(ThreadUtils.sameThread).onComplete {
+      // This is a very fast action so we can use "ThreadUtils.sameThread"
+      case Success(msg) =>
+        // Always receive `true`. Just ignore it
+      case Failure(e) =>
+        exitExecutor(1, s"Cannot register with driver: $driverUrl", e, notifyDriver = false)
+    }(ThreadUtils.sameThread)
+  }
+
+自此executor启动完成。

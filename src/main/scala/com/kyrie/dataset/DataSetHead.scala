@@ -9,7 +9,7 @@ object DataSetHead {
 
   def main(args: Array[String]) {
 
-    val spark = SparkSession.builder().master("local").appName(this.getClass.getSimpleName).getOrCreate()
+    val spark = SparkSession.builder().master("spark://192.168.1.61:7077").appName(this.getClass.getSimpleName).getOrCreate()
 
     val ds = spark.read.text("data/test.txt")
 
