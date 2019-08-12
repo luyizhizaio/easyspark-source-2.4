@@ -13,8 +13,14 @@ object FirstRemote {
 
     System.setProperty("HADOOP_USER_NAME","hadoop")
     val sc = sparkContext()
-    val rdd = sc.textFile("hdfs://192.168.1.61:9000/a.txt")
-    println(rdd.collect().mkString(","))
+    val rdd = sc.textFile("hdfs://192.168.1.61:9000/data.txt")
+
+    val rdd2 = rdd.map{word => word -> 1 }.reduceByKey(_ + _)
+
+
+    rdd2.saveAsTextFile("hdfs://192.168.1.61:9000/data_out")
+
+
   }
 
   def sparkContext(): SparkContext = {

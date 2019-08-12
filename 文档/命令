@@ -1,0 +1,2 @@
+打包命令
+clean scala:compile compile package
