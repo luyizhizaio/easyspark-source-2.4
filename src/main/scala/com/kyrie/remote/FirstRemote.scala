@@ -1,4 +1,4 @@
-package com.kyrie.first
+package com.kyrie.remote
 
 import org.apache.spark.{SparkConf, SparkContext}
 
