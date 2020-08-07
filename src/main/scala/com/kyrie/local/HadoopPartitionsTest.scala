@@ -1,7 +1,8 @@
 package com.kyrie.local
 
+import org.apache.hadoop.fs.{Path, FileSystem, Hdfs}
 import org.apache.spark.{SparkContext, SparkConf}
-
+import org.apache.hadoop.conf.Configuration
 /**
  * Created by tend on 2020/8/6.
  * 研究
@@ -82,6 +83,7 @@ object HadoopPartitionsTest {
        第1个分区读取：0到4，读取前3行
        第2个分区读取：4到8，因为4，5被读去了，从来6开始读到9。（因为按行读取所以读到9）
        第3个分区读取：8到12，因为8，9被读去了，从来10开始读到12。
+       第4个分区读取：
 
 
       第一个分区读取0到4这5个字节，所以把两行内容都读取了。第2，3两个分区为空。
@@ -90,9 +92,12 @@ object HadoopPartitionsTest {
 
 
      */
+    val conf = new Configuration()
+    val fs = FileSystem.getLocal(conf)
 
+    fs.delete(new Path("data/wc.out2"),true)
 
-    val df = sc.textFile("data/wc.txt")
+    val df = sc.textFile("data/wc.txt",3)
 
     df.saveAsTextFile("data/wc.out2")
 
