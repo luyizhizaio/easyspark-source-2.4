@@ -80,17 +80,10 @@ object HadoopPartitionsTest {
       10 11
       12
 
-       第1个分区读取：0到4，读取前3行
+       第1个分区读取：0到4，读取前3行 ；注意：当位移量偏过换行符时，会把下一行的数据也会读取了
        第2个分区读取：4到8，因为4，5被读去了，从来6开始读到9。（因为按行读取所以读到9）
        第3个分区读取：8到12，因为8，9被读去了，从来10开始读到12。
-       第4个分区读取：
-
-
-      第一个分区读取0到4这5个字节，所以把两行内容都读取了。第2，3两个分区为空。
-
-
-
-
+       第4个分区读取：12到13 所以为空
      */
     val conf = new Configuration()
     val fs = FileSystem.getLocal(conf)
@@ -100,6 +93,8 @@ object HadoopPartitionsTest {
     val df = sc.textFile("data/wc.txt",3)
 
     df.saveAsTextFile("data/wc.out2")
+
+    Thread.sleep(10000000)
 
 
   }
