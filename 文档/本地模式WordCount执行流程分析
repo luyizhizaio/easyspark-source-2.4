@@ -1,0 +1,188 @@
+1.WordCount 本地模式代码查看
+目标：
+    1) rdd分区
+    2) stage 划分
+    3）shuffle操作
+1.1.代码
+val sparkConf = new SparkConf().setMaster("local").setAppName("wordCount")
+val sc =new SparkContext(sparkConf)
+val rdd:RDD[String] = sc.textFile("data/wc.txt")
+val rdd2 = rdd.flatMap{line => line.split(" ")}
+val rdd3 = rdd2.map{word => word ->1}
+val rdd4 = rdd3.reduceByKey(_ + _)
+//触发job执行
+rdd4.foreach(println)
+
+1.2.local模式流程分析
+1)driver端代码
+ShuffledRDD.foreach
+    ->sc.runJob
+        ->SparkContext.runJob
+            ->DagScheduler.runJob
+                ->DagScheduler.submitJob
+                    ->eventProcessLoop.post(JobSubmitted())) //JobSubmitted 放入DAGSchedulerEventProcessLoop队列中。
+
+DAGSchedulerEventProcessLoop.run()  //执行线程的run方法
+    ->DAGScheduler.onReceive()
+        -> DAGScheduler.doOnReceive()
+            ->dagScheduler.handleJobSubmitted() //通过模式匹配执行此方法
+                ->finalStage = dagScheduler.createResultStage() //划分Stage
+                ->dagScheduler.submitStage(finalStage)
+                    ->dagScheduler.submitMissingTasks() //逐个提交finalStage依赖的Stage；做了两步操作
+                        ->分区转成任务集,不同stage拆分成不同任务
+                            ->ShuffleMapStage =>partitionsToCompute.map { id =>new ShuffleMapTask() }
+                            ->ResultStage => partitionsToCompute.map { id =>new ResultTask() }
+                        ->TaskSchedulerImpl.submitTasks
+                            ->LocalSchedulerBackend.reviveOffers
+                                ->RpcEndpointRef.send(ReviveOffers) //发送消息给executor
+
+2）executor端执行-ShuffleMapTask
+LocalEndpoint.receive //接收到reviveOffers的消息
+    ->LocalEndpoint.reviveOffers
+        ->TaskSchedulerImpl.resourceOffers(offers) //获取Task
+        -> executor.launchTask(executorBackend, task) //executor 启动任务
+            ->ShuffleMapTask.runTask
+                ->SortShuffleManager.getWriter() //获取SortShuffleWriter,选择不同shuffle Writer
+                    ->MapedPartitionsRDD.iterator()  //读取文件数据
+                        ->MapedPartitionsRDD.computeOrReadCheckpoint()
+                            ->MapedPartitionsRDD.compute()
+                                ->HadoopRDD.compute()
+                    ->SortShuffleWriter.write(records) //参数records就是分区内所有数据记录,并且已经执行了word => word ->1的结果
+                        ->ExternalSorter.insertAll(records)
+                            ->PartitionedAppendOnlyMap.changeValue() //往PartitionedAppendOnlyMap更新数据,这个map用于保存溢写前的数据,该map的key是(partition ID, K)
+                            ->addElementsRead()//每读一条记录+1,spill后清零。
+                            ->ExternalSorter.maybeSpillCollection() //判断是不是需要内存集合溢写到磁盘
+                                ->ExternalSorter.maybeSpill() //在spill之前尝试获取更多内存，判断是否需要spill
+                                    ->1.不需要spill,所有的数据写到ExternalSorter的map中
+                                    ->2.需要spill,同一分区会spill多次
+                                        ->ExternalSorter.spill(PartitionedAppendOnlyMap)//1.Spill our in-memory collection to a sorted file that we can merge later.2.We add this file into `spilledFiles` to find it later.
+                                            ->inMemoryIterator =PartitionedAppendOnlyMap.destructiveSortedWritablePartitionedIterator(comparator)//1.排序：分区内部key排序；2.返回可以迭代数据并写出元素到文件的WritablePartitionedIterator对象
+                                            ->spillFile = spillMemoryIteratorToDisk(inMemoryIterator) //溢写内存中的内容到磁盘的临时文件.
+                                                ->(blockId, file) = diskBlockManager.createTempShuffleBlock() //创建临时文件和块id,文件名称：temp_shuffle_UUID
+                        ->ExternalSorter.writePartitionedFile(blockId, tmp) //把ExternalSorter里面的数据写到磁盘，blockId :shuffle_0_4_0  命名规则：String = "shuffle_" + shuffleId + "_" + mapId + "_" + reduceId；tmp：就是输出目录
+                            ->DiskBlockObjectWriter.commitAndGet() //写到数据文件
+                        ->  shuffleBlockResolver.writeIndexFileAndCommit() //写索引文件，索引文件名称：shuffle_0_0_0.index
+
+2）executor端执行-ResultTask
+
+
+
+
+
+
+blockId :shuffle_0_4_0  命名规则：String = "shuffle_" + shuffleId + "_" + mapId + "_" + reduceId
+
+
+
+1) rdd分区
+
+
+2) stage 划分
+
+DAGScheduler.handleJobSubmitted() //创建finalStage，也就是ResultStage.
+    ->createResultStage(finalRDD, func, partitions, jobId, callSite) //创建resultstage
+        ->getOrCreateParentStages(rdd, jobId)
+            ->getShuffleDependencies(rdd).map{getOrCreateShuffleMapStage(shuffleDep, firstJobId)}
+            ->
+
+        ->new ResultStage(id, rdd, func, partitions, parents, jobId, callSite)
+    ->submitStage(finalStage)
+
+DAGScheduler类中handleJobSubmitted方法，创建finalStage，也就是ResultStage.
+private[scheduler] def handleJobSubmitted(jobId: Int,
+      finalRDD: RDD[_],
+      func: (TaskContext, Iterator[_]) => _,
+      partitions: Array[Int],
+      callSite: CallSite,
+      listener: JobListener,
+      properties: Properties) {
+
+    finalStage = createResultStage(finalRDD, func, partitions, jobId, callSite)
+
+    submitStage(finalStage)
+  }
+
+//创建finalstage
+createResultStage() {
+
+  val parents = getOrCreateParentStages(rdd, jobId)
+       /**
+         * Get or create the list of parent stages for a given RDD.  The new Stages will be created with
+         * the provided firstJobId.
+         */
+        private def getOrCreateParentStages(rdd: RDD[_], firstJobId: Int): List[Stage] = {
+          getShuffleDependencies(rdd).map { shuffleDep =>
+            getOrCreateShuffleMapStage(shuffleDep, firstJobId)
+          }.toList
+        }
+
+
+  val stage = new ResultStage(id, rdd, func, partitions, parents, jobId, callSite)
+}
+
+
+/**
+   * Gets a shuffle map stage if one exists in shuffleIdToMapStage. Otherwise, if the
+   * shuffle map stage doesn't already exist, this method will create the shuffle map stage in
+   * addition to any missing ancestor shuffle map stages.
+   */
+  private def getOrCreateShuffleMapStage(
+      shuffleDep: ShuffleDependency[_, _, _],
+      firstJobId: Int): ShuffleMapStage = {
+    shuffleIdToMapStage.get(shuffleDep.shuffleId) match {
+      case Some(stage) =>
+        stage
+
+      case None =>
+        // Create stages for all missing ancestor shuffle dependencies.
+        getMissingAncestorShuffleDependencies(shuffleDep.rdd).foreach { dep =>
+          // Even though getMissingAncestorShuffleDependencies only returns shuffle dependencies
+          // that were not already in shuffleIdToMapStage, it's possible that by the time we
+          // get to a particular dependency in the foreach loop, it's been added to
+          // shuffleIdToMapStage by the stage creation process for an earlier dependency. See
+          // SPARK-13902 for more information.
+          if (!shuffleIdToMapStage.contains(dep.shuffleId)) {
+            createShuffleMapStage(dep, firstJobId)
+          }
+        }
+        // Finally, create a stage for the given shuffle dependency.
+        createShuffleMapStage(shuffleDep, firstJobId)
+    }
+  }
+//
+
+(2) ShuffledRDD[4] at reduceByKey at WordCount.scala:27 []
+ +-(2) MapPartitionsRDD[3] at map at WordCount.scala:25 []
+    |  MapPartitionsRDD[2] at flatMap at WordCount.scala:23 []
+    |  data/wc.txt MapPartitionsRDD[1] at textFile at WordCount.scala:21 []
+    |  data/wc.txt HadoopRDD[0] at textFile at WordCount.scala:21 []
+
+
+
+//提交stage，首先递归地提交任何丢失的父stage。
+/** Submits stage, but first recursively submits any missing parents. */
+  private def submitStage(stage: Stage) {
+    val jobId = activeJobForStage(stage)
+    if (jobId.isDefined) {
+      logDebug("submitStage(" + stage + ")")
+      if (!waitingStages(stage) && !runningStages(stage) && !failedStages(stage)) {
+        val missing = getMissingParentStages(stage).sortBy(_.id)
+        logDebug("missing: " + missing)
+        if (missing.isEmpty) {
+          logInfo("Submitting " + stage + " (" + stage.rdd + "), which has no missing parents")
+          submitMissingTasks(stage, jobId.get)
+        } else {
+          for (parent <- missing) {
+            submitStage(parent)
+          }
+          waitingStages += stage
+        }
+      }
+    } else {
+      abortStage(stage, "No active job for stage " + stage.id, None)
+    }
+  }
+
+
+
+3）shuffle操作
