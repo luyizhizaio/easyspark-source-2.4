@@ -13,12 +13,12 @@ object WordCount {
 
     System.setProperty("hadoop.home.dir","C:\\hadoop")
 
-    val sparkConf = new SparkConf().setMaster("local[*]").setAppName("wordCount")
+    val sparkConf = new SparkConf().setMaster("local").setAppName("wordCount")
     sparkConf.set("spark.network.timeout","600")
     sparkConf.set("spark.executor.heartbeatInterval","500")
     val sc =new SparkContext(sparkConf)
 
-    val rdd:RDD[String] = sc.textFile("data/wc.txt",4) //HadoopRDD
+    val rdd:RDD[String] = sc.textFile("data/wc.txt",2) //HadoopRDD
 
     val rdd2 = rdd.flatMap{line => line.split(" ")}//MapPartitionsRDD
 
