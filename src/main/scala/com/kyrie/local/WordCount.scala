@@ -18,11 +18,11 @@ object WordCount {
     sparkConf.set("spark.executor.heartbeatInterval","500")
     val sc =new SparkContext(sparkConf)
 
-    val rdd:RDD[String] = sc.textFile("data/wc.txt",2) //HadoopRDD
+    val rdd:RDD[String] = sc.textFile("data/wc.txt",2) //MapPartitionsRDD[1] <-HadoopRDD[0]
 
-    val rdd2 = rdd.flatMap{line => line.split(" ")}//MapPartitionsRDD
+    val rdd2 = rdd.flatMap{line => line.split(" ")}//MapPartitionsRDD[2]
 
-    val rdd3 = rdd2.map{word => word ->1} //MapPartitionsRDD
+    val rdd3 = rdd2.map{word => word ->1} //MapPartitionsRDD[3]
 
     val rdd4 = rdd3.reduceByKey(_ + _) //ShuffledRDD
 
