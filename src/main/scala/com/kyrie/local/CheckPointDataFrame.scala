@@ -31,11 +31,11 @@ object CheckPointDataFrame {
       println("---------------------")
       row.getString(0).split(" ")
       .map{word => word ->1}
-    }.toDF().cache().checkpoint()
+    }.toDF().cache()
 
-    df2.unpersist()
+   // df2.unpersist()
 
-    Thread.sleep(100000000)
+    //Thread.sleep(100000000)
 
     println("count"+df2.count())
 
