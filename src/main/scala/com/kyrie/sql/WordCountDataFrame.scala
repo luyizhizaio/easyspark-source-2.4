@@ -1,8 +1,7 @@
-package com.kyrie.local
+package com.kyrie.sql
 
-import org.apache.spark.rdd.RDD
+import org.apache.spark.SparkConf
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.{SparkConf, SparkContext}
 
 /**
  * Created by tend on 2020/7/31.
@@ -20,13 +19,18 @@ object WordCountDataFrame {
 
     val df = spark.read.text("data/wc.txt")
 
+    df.explain(true)
+
     val num = df.count()
 
     println(num)
 
+    println(df.queryExecution.toString())
+
     df.explain(true)
 
-    Thread.sleep(100000000)
+   // Thread.sleep(100000000)
+
 
   }
 
